@@ -29,5 +29,4 @@ Documentation
 -------------
 
 - [LANGUAGE.md](LANGUAGE.md) - EBNF grammar and supported C99 features
-- [AGENTS.md](AGENTS.md) - Development guide (architecture, internals, code style)
 

@@ -1,2 +1,8 @@
-build
-tmp
+# Root-level repo folders only
+/build/
+/tmp/
+/.claude/
+/.cursor/
+
+# AI agents
+/AGENTS.md
