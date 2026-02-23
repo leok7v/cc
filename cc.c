@@ -20,6 +20,12 @@
 #include <string.h>
 #include <stdbool.h>
 
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#include <sys/mman.h>
+#include <sys/stat.h>
+#endif
+
 char *p, *lp, // current position in source code
      *data;   // data/bss pointer
 
@@ -103,7 +109,10 @@ enum {
 enum {
     I_OPEN = 64, I_READ, I_CLOS, I_PRTF, I_MALC, I_FREE, I_MSET, I_MCMP,
     I_EXIT, I_WRIT, I_SYST, I_POPN, I_PCLS, I_FRED, I_MCPY, I_MMOV,
-    I_SCPY, I_SCMP, I_SLEN, I_SCAT, I_SNCM, I_ASRT, I_ALCA, I_LAST
+    I_SCPY, I_SCMP, I_SLEN, I_SCAT, I_SNCM, I_ASRT, I_ALCA,
+    I_MRED, I_MCLS, I_MWRT,
+    I_LSEEK, I_MMAP, I_MUNMAP, I_MSYNC, I_FTRUNC, I_REN,
+    I_LAST
 };
 
 // types
@@ -379,6 +388,15 @@ void intrinsics() {
     intrinsic("strncmp", I_SNCM);
     intrinsic("assert", I_ASRT);
     intrinsic("alloca", I_ALCA);
+    intrinsic("memread", I_MRED);
+    intrinsic("memclose", I_MCLS);
+    intrinsic("memwrite", I_MWRT);
+    intrinsic("lseek", I_LSEEK);
+    intrinsic("mmap", I_MMAP);
+    intrinsic("munmap", I_MUNMAP);
+    intrinsic("msync", I_MSYNC);
+    intrinsic("ftruncate", I_FTRUNC);
+    intrinsic("rename", I_REN);
 }
 
 void expect(int64_t t, char *s) { // expect token t and advance, else fatal
@@ -1611,6 +1629,80 @@ void statement() {
     }
 }
 
+char* mem_read(const char* filename) {
+    char* return_ptr = 0;
+    int file_descriptor = open(filename, O_RDONLY);
+    
+    if (file_descriptor != -1) {
+        int64_t file_size = lseek(file_descriptor, 0, 2); // SEEK_END
+        lseek(file_descriptor, 0, 0); // SEEK_SET
+        
+        int64_t total_size = file_size + 16;
+        
+        char* mapped_memory = (char*)mmap(0, total_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        
+        if (mapped_memory != MAP_FAILED) {
+            int64_t* metadata = (int64_t*)mapped_memory;
+            metadata[0] = (int64_t)file_descriptor;
+            metadata[1] = total_size;
+            
+            read(file_descriptor, mapped_memory + 16, file_size);
+            return_ptr = (char*)(mapped_memory + 16);
+        }
+        
+        if (mapped_memory == MAP_FAILED) {
+            close(file_descriptor);
+        }
+    }
+    
+    return return_ptr;
+}
+
+void mem_close(char* pointer_to_memread_file) {
+    if (pointer_to_memread_file != 0) {
+        char* base_pointer = (char*)pointer_to_memread_file - 16;
+        int64_t* metadata = (int64_t*)base_pointer;
+        
+        int file_descriptor = (int)metadata[0];
+        int64_t total_size = metadata[1];
+        
+        close(file_descriptor);
+        munmap(base_pointer, total_size);
+    }
+}
+
+bool mem_write(const char* filename, const char* data, int64_t bytes) {
+    bool success_flag = false;
+    char temporary_name[1024];
+    strcpy(temporary_name, filename);
+    strcat(temporary_name, ".tmp");
+    
+    int file_descriptor = open(temporary_name, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    
+    if (file_descriptor != -1) {
+        int truncate_result = ftruncate(file_descriptor, bytes);
+        
+        if (truncate_result != -1) {
+            char* mapped_memory = (char*)mmap(0, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, file_descriptor, 0);
+            
+            if (mapped_memory != MAP_FAILED) {
+                memcpy(mapped_memory, data, bytes);
+                msync(mapped_memory, bytes, MS_SYNC);
+                munmap(mapped_memory, bytes);
+                
+                int rename_result = rename(temporary_name, filename);
+                if (rename_result == 0) {
+                    success_flag = true;
+                }
+            }
+        }
+        
+        close(file_descriptor);
+    }
+    
+    return success_flag;
+}
+
 // preprocessor helpers
 int pp_streq(char *a, int alen, char *b, int blen) {
     if (alen != blen) { return 0; }
@@ -2148,6 +2240,35 @@ char *preprocess(char *src, int srclen, char *out, char *filename, int depth) {
     return o;
 }
 
+void add_symbol(char *name, int64_t val) {
+    p = name;
+    next();
+    id[Class] = Num;
+    id[Type] = INT64;
+    id[Val] = val;
+}
+
+void init_definitions() {
+    // From sys/mman.h
+    add_symbol("PROT_READ", 1);
+    add_symbol("PROT_WRITE", 2);
+    add_symbol("MAP_SHARED", 1);
+    add_symbol("MAP_PRIVATE", 2);
+    add_symbol("MAP_FAILED", 0xFFFFFFFFFFFFFFFF); // (void*)-1
+    add_symbol("MAP_ANON", 0x1000);
+    add_symbol("MS_SYNC", 0x10000); // from macOS
+    // From fcntl.h
+    add_symbol("O_RDONLY", 0);
+    add_symbol("O_WRONLY", 1);
+    add_symbol("O_RDWR", 2);
+    add_symbol("O_CREAT", 0x200);
+    add_symbol("O_TRUNC", 0x400);
+    // From unistd.h (for lseek)
+    add_symbol("SEEK_SET", 0);
+    add_symbol("SEEK_CUR", 1);
+    add_symbol("SEEK_END", 2);
+}
+
 int64_t *compile(char *filename) {
     int64_t fd;
     fd = open(filename, 0);
@@ -2178,6 +2299,7 @@ int64_t *compile(char *filename) {
     i = Bool;
     while (i <= Continue) { next(); id[Tk] = i++; }
     { char *save_p = p; intrinsics(); p = save_p; } // intrinsics
+    { char *save_p = p; init_definitions(); p = save_p; } // constants
     next(); id[Tk] = Char; // void type
     next(); id[Class] = Num; id[Type] = INT64; id[Val] = 1; // true
     next(); id[Class] = Num; id[Type] = INT64; id[Val] = 0; // false
@@ -2966,6 +3088,15 @@ int run(int64_t *pc, int argc, char **argv) {
                 }
                 break;
             case I_ALCA: a = (int64_t)malloc(*sp); break;
+            case I_MRED: a = (int64_t)mem_read((const char *)*sp); break;
+            case I_MCLS: mem_close((char *)*sp); break;
+            case I_MWRT: a = mem_write((const char*)sp[2], (const char*)sp[1], sp[0]); break;
+            case I_LSEEK: a = lseek(sp[2], sp[1], sp[0]); break;
+            case I_MMAP: a = (int64_t)mmap((void*)sp[5], sp[4], sp[3], sp[2], sp[1], sp[0]); break;
+            case I_MUNMAP: a = munmap((void*)sp[1], sp[0]); break;
+            case I_MSYNC: a = msync((void*)sp[2], sp[1], sp[0]); break;
+            case I_FTRUNC: a = ftruncate(sp[1], sp[0]); break;
+            case I_REN: a = rename((const char*)sp[1], (const char*)sp[0]); break;
             default:
                 printf("unknown instruction = %d! cycle = %d\n",
                     (int)i, (int)cycle);
